@@ -26,7 +26,13 @@ try:
 except ImportError:
     MQTT_AVAILABLE = False
 
-from agent import run_delirium_agent
+# AMR LLM agent is disabled for now (no AMR cohort CSV available). Import guarded.
+try:
+    from agent import run_delirium_agent as run_amr_agent  # noqa: F401
+    AGENT_AVAILABLE = True
+except Exception:
+    run_amr_agent = None
+    AGENT_AVAILABLE = False
 
 app = Flask(__name__)
 
@@ -34,158 +40,127 @@ app = Flask(__name__)
 # CONFIG
 # ──────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-XGB_PATH = os.environ.get("DW_XGB_PATH", os.path.join(BASE_DIR, "..", "xgb_model.pkl"))
-LR_PATH = os.environ.get("DW_LR_PATH", os.path.join(BASE_DIR, "..", "lr_model.pkl"))
-ENSEMBLE_PATH = os.environ.get("DW_ENSEMBLE_PATH", os.path.join(BASE_DIR, "..", "deliriumwatch_ensemble.pkl"))
-FEATURE_NAMES_PATH = os.environ.get("DW_FEATS_PATH", os.path.join(BASE_DIR, "..", "feature_names.pkl"))
+# AMR model: a single soft-voting ensemble (LightGBM + XGBoost + CatBoost).
+# It bakes in feature_names_in_, so no separate feature_names.pkl is required.
+AMR_MODEL_PATH = os.environ.get("DW_AMR_PATH", os.path.join(BASE_DIR, "..", "final_best_model.pkl"))
 
 MQTT_BROKER = os.environ.get("DW_MQTT_BROKER", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("DW_MQTT_PORT", "1883"))
 
-ICU_OPTIONS = [
-    "Medical Intensive Care Unit (MICU)",
-    "Surgical Intensive Care Unit (SICU)",
-    "Cardiac Vascular Intensive Care Unit (CVICU)",
-    "Coronary Care Unit (CCU)",
-    "Trauma SICU (TSICU)",
-    "Neuro SICU",
-    "Neuro Intermediate",
-    "Neuro Stepdown",
-    "PACU",
-    "Other",
-]
-
 ZONE_OPTIONS = ["Bay A", "Bay B", "Bay C", "Bay D"]
 
-# Hard-coded best AUROCs from temporal notebook
+# Per-(sub)model AUROC from the AMR manuscript leaderboard (README §6.1)
 METRICS = {
-    "xgb": 0.8511,           # XGBoost Temporal AUROC
-    "lr": 0.76,              # approx baseline
-    "ensemble": 0.8526,      # Voting Ensemble Temporal AUROC
-}
-
-# Quick preset patient profiles for demo
-PRESETS = {
-    "high_septic": {
-        "patient_name": "MARTINEZ, CARLOS",
-        "patient_bed": "MICU-A-02",
-        "patient_zone": "Bay A",
-        "gender_select": "Male",
-        "age": 78, "avg_sofa": 11.0, "admission_sofa": 9.0,
-        "hr_mean": 112.0, "hr_std": 18.0, "rr_mean": 28.0, "rr_std": 6.0,
-        "spo2_mean": 91.0, "spo2_min": 84.0, "nibp_mean": 62.0, "abp_measured": 1.0,
-        "propofol_total": 1200.0, "midazolam_total": 25.0,
-        "lorazepam_total": 8.0, "fentanyl_total": 1500.0,
-        "unique_sedation_drugs": 4.0, "nid_score": 0.58,
-        "icu_select": "Medical Intensive Care Unit (MICU)",
-    },
-    "medium_postsurg": {
-        "patient_name": "JOHNSON, MARY",
-        "patient_bed": "SICU-B-07",
-        "patient_zone": "Bay B",
-        "gender_select": "Female",
-        "age": 71, "avg_sofa": 7.0, "admission_sofa": 6.0,
-        "hr_mean": 98.0, "hr_std": 14.0, "rr_mean": 22.0, "rr_std": 4.5,
-        "spo2_mean": 94.0, "spo2_min": 89.0, "nibp_mean": 72.0, "abp_measured": 1.0,
-        "propofol_total": 600.0, "midazolam_total": 12.0,
-        "lorazepam_total": 4.0, "fentanyl_total": 900.0,
-        "unique_sedation_drugs": 3.0, "nid_score": 0.42,
-        "icu_select": "Surgical Intensive Care Unit (SICU)",
-    },
-    "low_stable": {
-        "patient_name": "CHEN, DAVID",
-        "patient_bed": "CCU-C-01",
-        "patient_zone": "Bay C",
-        "gender_select": "Male",
-        "age": 55, "avg_sofa": 3.0, "admission_sofa": 2.0,
-        "hr_mean": 78.0, "hr_std": 8.0, "rr_mean": 16.0, "rr_std": 2.5,
-        "spo2_mean": 98.0, "spo2_min": 95.0, "nibp_mean": 85.0, "abp_measured": 0.0,
-        "propofol_total": 0.0, "midazolam_total": 0.0,
-        "lorazepam_total": 0.0, "fentanyl_total": 200.0,
-        "unique_sedation_drugs": 1.0, "nid_score": 0.22,
-        "icu_select": "Coronary Care Unit (CCU)",
-    },
-    "neuro_trauma": {
-        "patient_name": "RODRIGUEZ, LUIS",
-        "patient_bed": "Neuro-SICU-04",
-        "patient_zone": "Bay D",
-        "gender_select": "Male",
-        "age": 42, "avg_sofa": 8.0, "admission_sofa": 8.0,
-        "hr_mean": 88.0, "hr_std": 10.0, "rr_mean": 18.0, "rr_std": 3.0,
-        "spo2_mean": 96.0, "spo2_min": 92.0, "nibp_mean": 95.0, "abp_measured": 1.0,
-        "propofol_total": 2400.0, "midazolam_total": 0.0,
-        "lorazepam_total": 0.0, "fentanyl_total": 2500.0,
-        "unique_sedation_drugs": 2.0, "nid_score": 0.65,
-        "icu_select": "Neuro SICU",
-    },
-    "cardiac_arrest": {
-        "patient_name": "SMITH, ROBERT",
-        "patient_bed": "CVICU-A-01",
-        "patient_zone": "Bay A",
-        "gender_select": "Male",
-        "age": 68, "avg_sofa": 12.0, "admission_sofa": 10.0,
-        "hr_mean": 105.0, "hr_std": 20.0, "rr_mean": 24.0, "rr_std": 5.0,
-        "spo2_mean": 92.0, "spo2_min": 85.0, "nibp_mean": 65.0, "abp_measured": 1.0,
-        "propofol_total": 0.0, "midazolam_total": 45.0,
-        "lorazepam_total": 12.0, "fentanyl_total": 1200.0,
-        "unique_sedation_drugs": 3.0, "nid_score": 0.88,
-        "icu_select": "Cardiac Vascular Intensive Care Unit (CVICU)",
-    },
+    "ensemble": 0.8613,   # Soft Voting Ensemble
+    "lgb": 0.8584,        # LightGBM
+    "xgb": 0.8632,        # XGBoost
+    "cat": 0.8522,        # CatBoost
 }
 
 # ──────────────────────────────────────────────────────────────────
-# MODEL LOADING
+# PREPROCESSING ASSETS (built by build_amr_assets.py from the engineered
+# dataset). These give us the model's REAL label-encoders, name→itemid maps,
+# training medians and dropdown option lists, so inference is faithful.
+# ──────────────────────────────────────────────────────────────────
+PREPROCESS_PATH = os.environ.get("DW_PREPROCESS_PATH", os.path.join(BASE_DIR, "..", "amr_preprocess.pkl"))
+PRESETS_PATH = os.environ.get("DW_PRESETS_PATH", os.path.join(BASE_DIR, "..", "amr_presets.json"))
+
+EXPOSURE_FLAGS = [
+    ("exp_penicillin", "Penicillin"),
+    ("exp_cephalosporin", "Cephalosporin"),
+    ("exp_carbapenem", "Carbapenem"),
+    ("exp_fluoroquinolone", "Fluoroquinolone"),
+    ("exp_macrolide", "Macrolide"),
+]
+
+COMORBIDITY_FLAGS = [
+    ("has_diabetes", "Diabetes"),
+    ("has_ckd", "CKD"),
+    ("has_copd", "COPD"),
+    ("has_liver_disease", "Liver disease"),
+    ("has_malignancy", "Malignancy"),
+]
+
+# Numeric form fields and their default values
+FORM_NUMERIC_DEFAULTS = {
+    "age": 65,
+    "days_since_admission": 3,
+    "prior_resistant_count": 0,
+    "num_previous_cultures": 1,
+    "antibiotic_count_90d": 2,
+    "days_since_last_antibiotic": 15,
+    "wbc_max": 11.0,
+    "hemoglobin_max": 11.5,
+    "creatinine_last_value": 1.1,
+    "platelets_last_value": 210,
+    "lactate_max": 1.6,
+}
+
+
+# ──────────────────────────────────────────────────────────────────
+# MODEL + PREPROCESSING LOADING
 # ──────────────────────────────────────────────────────────────────
 def safe_load(path: str):
     if not path or not os.path.exists(path):
         return None
     try:
         return joblib.load(path)
-    except Exception:
+    except Exception as e:
+        print(f"Failed to load {path}: {e}")
         return None
 
 
-def load_feature_names() -> List[str]:
-    feats = safe_load(FEATURE_NAMES_PATH)
-    if isinstance(feats, (list, tuple)):
-        return list(feats)
-    return []
+AMR_MODEL = safe_load(AMR_MODEL_PATH)
+FEATURE_NAMES: List[str] = list(getattr(AMR_MODEL, "feature_names_in_", [])) if AMR_MODEL is not None else []
+print(f"AMR model loaded: {AMR_MODEL is not None} ({len(FEATURE_NAMES)} features)")
+
+PREPROCESS = safe_load(PREPROCESS_PATH) or {}
+ENCODERS = PREPROCESS.get("encoders", {})              # {col: LabelEncoder}
+ORG_TO_ITEMID = PREPROCESS.get("org_to_itemid", {})
+AB_TO_ITEMID = PREPROCESS.get("ab_to_itemid", {})
+SPEC_TO_ITEMID = PREPROCESS.get("spec_to_itemid", {})
+MEDIANS = PREPROCESS.get("medians", pd.Series(dtype=float))
+ORGANISM_OPTIONS = PREPROCESS.get("organism_options", [])
+ANTIBIOTIC_OPTIONS = PREPROCESS.get("antibiotic_options", [])
+SPECIMEN_OPTIONS = PREPROCESS.get("specimen_options", [])
+ADMISSION_LOCATION_OPTIONS = PREPROCESS.get("admission_location_options", [])
+ADMISSION_TYPE_OPTIONS = PREPROCESS.get("admission_type_display", [])
+print(f"Preprocessing assets loaded: {bool(PREPROCESS)} "
+      f"({len(ORGANISM_OPTIONS)} organisms, {len(ANTIBIOTIC_OPTIONS)} antibiotics)")
 
 
-XGB_MODEL = safe_load(XGB_PATH)
-LR_MODEL = safe_load(LR_PATH)
-ENSEMBLE_MODEL = safe_load(ENSEMBLE_PATH)
-FEATURE_NAMES = load_feature_names()
+def _first(seq, fallback=""):
+    return seq[0] if seq else fallback
 
-# ──────────────────────────────────────────────────────────────────
-# TEST COHORT — loaded once at startup for agent pipeline
-# ──────────────────────────────────────────────────────────────────
-_DATA_CSV       = os.environ.get("DW_DATA_CSV",       os.path.join(BASE_DIR, "..", "deliriumwatch_clean_tv.csv"))
-_YEAR_GROUPS_CSV = os.environ.get("DW_YEAR_GROUPS_CSV", os.path.join(BASE_DIR, "..", "year_groups.csv"))
 
+# Select/flag form-field defaults (used to repopulate the form), drawn from real options
+FORM_SELECT_DEFAULTS = {
+    "gender_select": "Male",
+    "icu_select": "Yes",
+    "admission_type": _first(ADMISSION_TYPE_OPTIONS),
+    "admission_location": _first(ADMISSION_LOCATION_OPTIONS),
+    "specimen_source": _first(SPECIMEN_OPTIONS),
+    "org_select": _first(ORGANISM_OPTIONS, "ESCHERICHIA COLI"),
+    "ab_select": _first(ANTIBIOTIC_OPTIONS, "AMPICILLIN"),
+    "prior_amr_history": "No",
+}
+
+# Real example patients (built from the dataset; stripped of internal _pred/_label)
+def _load_presets() -> Dict:
+    try:
+        with open(PRESETS_PATH) as f:
+            raw = json.load(f)
+        return {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")} for k, v in raw.items()}
+    except Exception as e:
+        print(f"Could not load presets: {e}")
+        return {}
+
+PRESETS = _load_presets()
+
+# Agent cohort disabled — kept as empty placeholders so routes stay alive.
 X_test = pd.DataFrame()
 y_test = pd.Series(dtype=int)
 high_risk_indices: List[int] = []
-
-try:
-    _df          = pd.read_csv(_DATA_CSV)
-    _year_groups = pd.read_csv(_YEAR_GROUPS_CSV)
-    _X           = _df.drop(columns=["delirium_label"])
-    _y           = _df["delirium_label"]
-    _test_mask   = _year_groups["anchor_year_group"].isin(["2017 - 2019", "2020 - 2022"])
-    X_test       = _X[_test_mask.values].reset_index(drop=True)
-    y_test       = _y[_test_mask.values].reset_index(drop=True)
-    print(f"Test cohort loaded: {len(X_test)} patients")
-except Exception as _e:
-    print(f"Could not load test cohort: {_e}")
-
-try:
-    _y_pred_proba     = ENSEMBLE_MODEL.predict_proba(X_test)[:, 1]
-    high_risk_indices = [int(i) for i, p in enumerate(_y_pred_proba) if p > 0.70]
-    print(f"High risk patients found: {len(high_risk_indices)}")
-except Exception as _e:
-    print(f"Could not compute high risk indices: {_e}")
-    high_risk_indices = list(range(0, 20))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -325,128 +300,192 @@ start_mqtt_listener()
 
 
 # ──────────────────────────────────────────────────────────────────
-# FEATURE ENGINEERING
+# FEATURE ENGINEERING (AMR)
 # ──────────────────────────────────────────────────────────────────
-def make_default_values() -> Dict[str, float]:
-    return {
-        "age": 65.0,
-        "gender": 0.0,
-        "avg_sofa": 6.0,
-        "admission_sofa": 5.0,
-        "hr_mean": 92.0,
-        "hr_std": 12.0,
-        "rr_mean": 21.0,
-        "rr_std": 4.0,
-        "spo2_mean": 96.0,
-        "spo2_min": 90.0,
-        "nibp_mean": 78.0,
-        "abp_measured": 1.0,
-        "propofol_total": 400.0,
-        "midazolam_total": 10.0,
-        "lorazepam_total": 4.0,
-        "fentanyl_total": 800.0,
-        "unique_sedation_drugs": 2.0,
-        "nid_score": 0.35,
-    }
+def make_default_values() -> Dict:
+    """Default values for repopulating the form (keyed by form field name)."""
+    vals: Dict = {}
+    vals.update(FORM_NUMERIC_DEFAULTS)
+    vals.update(FORM_SELECT_DEFAULTS)
+    for key, _ in EXPOSURE_FLAGS:
+        vals[key] = 0
+    for key, _ in COMORBIDITY_FLAGS:
+        vals[key] = 0
+    return vals
 
 
-def build_row_from_form(form) -> Tuple[pd.DataFrame, Dict[str, float], str]:
-    values = make_default_values()
-    for key in values.keys():
+def collect_form_values(form) -> Dict:
+    """Read all known form fields back out (for re-rendering the form)."""
+    vals = make_default_values()
+    for key in FORM_NUMERIC_DEFAULTS:
+        raw = form.get(key, None)
+        if raw not in (None, ""):
+            try:
+                vals[key] = float(raw)
+            except Exception:
+                pass
+    for key in FORM_SELECT_DEFAULTS:
+        raw = form.get(key, None)
+        if raw not in (None, ""):
+            vals[key] = raw
+    for key, _ in EXPOSURE_FLAGS:
+        vals[key] = 1 if form.get(key) in ("1", "on", "Yes", "true", "True") else 0
+    for key, _ in COMORBIDITY_FLAGS:
+        vals[key] = 1 if form.get(key) in ("1", "on", "Yes", "true", "True") else 0
+    return vals
+
+
+def _encode(col: str, value: str) -> float:
+    """Label-encode a categorical value with the model's real encoder.
+    Unseen values fall back to the column's training median code."""
+    enc = ENCODERS.get(col)
+    if enc is not None:
+        classes = set(map(str, enc.classes_))
+        if str(value) in classes:
+            return float(enc.transform([str(value)])[0])
+    med = MEDIANS.get(col)
+    return float(med) if med is not None and np.isfinite(med) else 0.0
+
+
+def _clean_admission_type(raw: str) -> str:
+    return str(raw).replace(".", "").replace(" ", "_")
+
+
+def build_row_from_form(form) -> Tuple[pd.DataFrame, Dict]:
+    """Map the AMR form into a full 135-feature row in model order, using the
+    real label-encoders and training medians for unspecified features."""
+    values = collect_form_values(form)
+
+    # Baseline every feature to its training median (a realistic 'typical patient')
+    row: Dict[str, float] = {}
+    for c in FEATURE_NAMES:
+        m = MEDIANS.get(c)
+        row[c] = float(m) if m is not None and np.isfinite(m) else 0.0
+
+    def setf(col: str, val: float):
+        if col in row and val is not None and np.isfinite(val):
+            row[col] = float(val)
+
+    def num(key: str) -> float:
         try:
-            raw = form.get(key, None)
-            if raw is not None and raw != "":
-                values[key] = float(raw)
+            return float(values.get(key, FORM_NUMERIC_DEFAULTS.get(key, 0)))
         except Exception:
-            continue
+            return float(FORM_NUMERIC_DEFAULTS.get(key, 0))
 
-    gender_str = form.get("gender_select", "Male")
-    values["gender"] = 0.0 if gender_str == "Male" else 1.0
+    # Demographics
+    age = num("age")
+    setf("age", age)
+    setf("elderly_flag", 1.0 if age >= 65 else 0.0)
+    setf("very_elderly_flag", 1.0 if age >= 80 else 0.0)
+    setf("sex_M", 1.0 if values.get("gender_select", "Male") == "Male" else 0.0)
 
-    icu_sel = form.get("icu_select", ICU_OPTIONS[0])
+    # Encounter
+    setf("icu_admission", 1.0 if values.get("icu_select", "Yes") == "Yes" else 0.0)
+    dsa = num("days_since_admission")
+    setf("days_since_admission", dsa)
+    setf("prolonged_stay", 1.0 if dsa > 7 else 0.0)
+    setf("very_prolonged_stay", 1.0 if dsa > 14 else 0.0)
 
-    # Build dataframe in FEATURE_NAMES order
-    if not FEATURE_NAMES:
-        # Fallback: simple order from values + ICU
-        cols = list(values.keys())
-        row = pd.DataFrame([[values[c] for c in cols]], columns=cols)
-    else:
-        data = {}
-        for col in FEATURE_NAMES:
-            if col in values:
-                data[col] = values[col]
-            elif col.startswith("icu_"):
-                # one-hot ICU
-                icu_name = col.replace("icu_", "")
-                data[col] = 1.0 if icu_name == icu_sel else 0.0
-            else:
-                data[col] = 0.0
-        row = pd.DataFrame([data])
+    # Admission type one-hot (clear the group, set the chosen one) + emergency flag
+    at = _clean_admission_type(values.get("admission_type", ""))
+    emergency = False
+    for c in FEATURE_NAMES:
+        if c.startswith("admission_type_"):
+            is_sel = (c == f"admission_type_{at}")
+            row[c] = 1.0 if is_sel else 0.0
+            if is_sel and ("EMER" in c or c.endswith("URGENT")):
+                emergency = True
+    setf("emergency_flag", 1.0 if emergency else 0.0)
+    setf("admission_location", _encode("admission_location", values.get("admission_location", "")))
 
-    return row, values, icu_sel
+    # Specimen / microbiology — real encodings + itemid lookups
+    spec = str(values.get("specimen_source", ""))
+    setf("spec_type_desc", _encode("spec_type_desc", spec))
+    if spec in SPEC_TO_ITEMID:
+        setf("spec_itemid", SPEC_TO_ITEMID[spec])
+    setf("source_urine", 1.0 if "URINE" in spec.upper() else 0.0)
+    setf("source_blood", 1.0 if "BLOOD" in spec.upper() else 0.0)
+
+    org = str(values.get("org_select", ""))
+    setf("org_name", _encode("org_name", org))
+    if org in ORG_TO_ITEMID:
+        setf("org_itemid", ORG_TO_ITEMID[org])
+    ab = str(values.get("ab_select", ""))
+    setf("ab_name", _encode("ab_name", ab))
+    if ab in AB_TO_ITEMID:
+        setf("ab_itemid", AB_TO_ITEMID[ab])
+
+    # Prior AMR history (top predictor)
+    setf("prior_amr_history", 1.0 if values.get("prior_amr_history", "No") == "Yes" else 0.0)
+    setf("prior_resistant_count", num("prior_resistant_count"))
+    setf("num_previous_cultures", num("num_previous_cultures"))
+
+    # Antibiotic exposure
+    setf("antibiotic_count_90d", num("antibiotic_count_90d"))
+    setf("antibiotic_count_30d", min(num("antibiotic_count_90d"), 4))
+    setf("days_since_last_antibiotic", num("days_since_last_antibiotic"))
+    for key, _ in EXPOSURE_FLAGS:
+        setf(key, 1.0 if values.get(key) else 0.0)
+
+    # Comorbidities
+    comorbid_count = 0
+    for key, _ in COMORBIDITY_FLAGS:
+        v = 1.0 if values.get(key) else 0.0
+        setf(key, v)
+        comorbid_count += int(v)
+    setf("comorbidity_count", comorbid_count)
+
+    # Labs (set last_value + max where available; derive flags)
+    wbc = num("wbc_max"); setf("wbc_max", wbc); setf("wbc_last_value", wbc)
+    setf("leukocytosis", 1.0 if wbc > 11 else 0.0)
+    hgb = num("hemoglobin_max"); setf("hemoglobin_max", hgb); setf("hemoglobin_last_value", hgb)
+    cr = num("creatinine_last_value"); setf("creatinine_last_value", cr); setf("creatinine_max", cr)
+    plt = num("platelets_last_value"); setf("platelets_last_value", plt); setf("platelets_max", plt)
+    lac = num("lactate_max"); setf("lactate_max", lac); setf("lactate_last_value", lac)
+    setf("lactate_elevated", 1.0 if lac > 2 else 0.0)
+
+    setf("age_x_comorbidities", age * comorbid_count)
+
+    X = pd.DataFrame([row], columns=FEATURE_NAMES)
+    return X, values
 
 
-def predict_proba_model(model_name: str, X: pd.DataFrame) -> float:
-    model = {
-        "xgb": XGB_MODEL,
-        "lr": LR_MODEL,
-        "ensemble": ENSEMBLE_MODEL,
-    }.get(model_name)
-    if model is None or not hasattr(model, "predict_proba"):
-        return float("nan")
-    
-    # Scale X using mock statistics since X_test dataset is unavailable
-    if model_name == "lr":
+def predict_amr(X: pd.DataFrame) -> Dict[str, float]:
+    """Return resistance probability for the ensemble + each sub-model (faithful)."""
+    out: Dict[str, float] = {}
+    if AMR_MODEL is None or not hasattr(AMR_MODEL, "predict_proba"):
+        return out
+    try:
+        out["ensemble"] = float(AMR_MODEL.predict_proba(X)[:, 1][0])
+    except Exception as e:
+        print(f"Ensemble predict failed: {e}")
+        out["ensemble"] = float("nan")
+    for name, est in getattr(AMR_MODEL, "named_estimators_", {}).items():
         try:
-            default_vals = make_default_values()
-            X_mean = pd.Series(default_vals).reindex(X.columns).fillna(0)
-            X_std = (X_mean.abs() / 2) + 1.0 # arbitrary std to scale down inputs
-            X_scaled = (X - X_mean) / X_std
-            prob = model.predict_proba(X_scaled)[:, 1][0]
-        except Exception as e:
-            print(f"LR scaling failed: {e}")
-            prob = model.predict_proba(X)[:, 1][0]
-    else:
-        # Raw predict proba
-        prob = model.predict_proba(X)[:, 1][0]
-    
-    # --- CALIBRATION INTERCEPT SHIFT ---
-    # XGBoost and Ensemble were trained with scale_pos_weight which artificially inflates 
-    # the bias term. We apply a logit intercept shift to counter this and map probabilities 
-    # back to true clinical risk percentiles (Centers median ~0.8 back to ~0.5)
-    prob_clip = max(0.001, min(0.999, prob))
-    log_odds = np.log(prob_clip / (1 - prob_clip))
-    
-    # Subtracting the empirical bias offset (~1.38 log-odds shift observed in distributions)
-    adjusted_log_odds = log_odds - 1.38
-    calibrated_prob = 1 / (1 + np.exp(-adjusted_log_odds))
-    
-    return float(calibrated_prob)
-
-def predict_all_models(X: pd.DataFrame) -> Dict[str, float]:
-    """Return probabilities from all three models."""
-    return {
-        "xgb": predict_proba_model("xgb", X),
-        "lr": predict_proba_model("lr", X),
-        "ensemble": predict_proba_model("ensemble", X),
-    }
+            out[name] = float(est.predict_proba(X)[:, 1][0])
+        except Exception:
+            out[name] = float("nan")
+    return out
 
 
 def risk_label(prob: float) -> str:
+    # Bands on the model's true (faithful) probability. LOW/MEDIUM boundary at the
+    # README §8 Youden-optimal threshold (0.1684); HIGH at the default 0.50 cut.
     if not np.isfinite(prob):
         return "UNKNOWN"
-    if prob >= 0.65:
+    if prob >= 0.50:
         return "HIGH"
-    elif prob >= 0.40:
+    elif prob >= 0.1684:
         return "MEDIUM"
     return "LOW"
 
 
 def compute_shap_dict(X: pd.DataFrame) -> Dict[str, float]:
-    if shap is None or XGB_MODEL is None:
+    if shap is None or AMR_MODEL is None:
         return {}
     try:
-        explainer = shap.TreeExplainer(XGB_MODEL)
+        xgb = AMR_MODEL.named_estimators_["xgb"]
+        explainer = shap.TreeExplainer(xgb)
         vals = explainer.shap_values(X)
         if isinstance(vals, list):
             vals = vals[1][0]
@@ -455,7 +494,8 @@ def compute_shap_dict(X: pd.DataFrame) -> Dict[str, float]:
             if getattr(vals, "ndim", 1) > 1 and vals.shape[1] == 2:
                 vals = vals[:, 1]
         return {feat: float(v) for feat, v in zip(X.columns, vals)}
-    except Exception:
+    except Exception as e:
+        print(f"SHAP failed: {e}")
         return {}
 
 
@@ -466,9 +506,9 @@ def dispatch_to_pagers(patient_name: str, bed: str, zone: str, risk_pct: str, ri
     """Publish alert to the correct pager(s) via MQTT."""
     if not MQTT_AVAILABLE:
         return "mqtt_unavailable"
-    
-    action = "CAM-ICU STAT" if label == "HIGH" else "MONITOR NID"
-    
+
+    action = "CONTACT PRECAUTIONS" if label == "HIGH" else "REVIEW EMPIRIC ABX"
+
     alert_payload = json.dumps({
         "patient": patient_name,
         "bed": bed,
@@ -485,7 +525,7 @@ def dispatch_to_pagers(patient_name: str, bed: str, zone: str, risk_pct: str, ri
         # Find pagers assigned to this zone
         pagers = get_pagers()
         zone_pagers = [pid for pid, info in pagers.items() if info.get("zone") == zone]
-        
+
         # Send to zone-specific pagers
         for pid in zone_pagers:
             mqtt_publish.single(
@@ -513,7 +553,6 @@ def index():
     label = None
     shap_items: List[Tuple[str, float]] = []
     values = make_default_values()
-    icu_sel = ICU_OPTIONS[0]
     shap_max = 0.01
     all_probs = {}
     patient_name = ""
@@ -523,16 +562,15 @@ def index():
     dispatch_status = None
 
     if request.method == "POST":
-        selected_model = request.form.get("model_select", "ensemble")
         patient_name = request.form.get("patient_name", "UNKNOWN")
         patient_bed = request.form.get("patient_bed", "N/A")
         patient_zone = request.form.get("patient_zone", "Bay A")
         gender_select = request.form.get("gender_select", "Male")
-        
-        X_row, values, icu_sel = build_row_from_form(request.form)
-        prob = predict_proba_model(selected_model, X_row)
+
+        X_row, values = build_row_from_form(request.form)
+        all_probs = predict_amr(X_row)
+        prob = all_probs.get("ensemble", float("nan"))
         label = risk_label(prob)
-        all_probs = predict_all_models(X_row)
 
         # Add to ward roster
         patient_entry = {
@@ -540,7 +578,6 @@ def index():
             "bed": patient_bed,
             "zone": patient_zone,
             "gender": gender_select,
-            "icu": icu_sel,
             "risk_raw": prob,
             "risk_pct": f"{prob*100:.1f}%",
             "label": label,
@@ -565,9 +602,14 @@ def index():
     return render_template(
         "index.html",
         values=values,
-        icu_options=ICU_OPTIONS,
-        icu_sel=icu_sel,
         zone_options=ZONE_OPTIONS,
+        organism_options=ORGANISM_OPTIONS,
+        antibiotic_options=ANTIBIOTIC_OPTIONS,
+        specimen_options=SPECIMEN_OPTIONS,
+        admission_type_options=ADMISSION_TYPE_OPTIONS,
+        admission_location_options=ADMISSION_LOCATION_OPTIONS,
+        exposure_flags=EXPOSURE_FLAGS,
+        comorbidity_flags=COMORBIDITY_FLAGS,
         selected_model=selected_model,
         aurocs=METRICS,
         prob=prob,
@@ -577,11 +619,7 @@ def index():
         shap_max=shap_max,
         shap_available=bool(shap_items),
         shap_json=json.dumps([{"name": k, "value": v} for k, v in shap_items]) if shap_items else "[]",
-        models_loaded={
-            "xgb": XGB_MODEL is not None,
-            "lr": LR_MODEL is not None,
-            "ensemble": ENSEMBLE_MODEL is not None,
-        },
+        models_loaded={"ensemble": AMR_MODEL is not None},
         patient_name=patient_name,
         patient_bed=patient_bed,
         patient_zone=patient_zone,
@@ -639,7 +677,7 @@ def api_preset(preset_id):
 
 
 # ──────────────────────────────────────────────────────────────────
-# AGENT ROUTES
+# AGENT ROUTES (disabled — no AMR cohort CSV)
 # ──────────────────────────────────────────────────────────────────
 @app.route("/agent", methods=["GET"])
 def agent_view():
@@ -648,34 +686,7 @@ def agent_view():
 
 @app.route("/api/agent/run", methods=["POST"])
 def api_agent_run():
-    try:
-        body        = request.get_json(force=True) or {}
-        patient_idx = body.get("patient_idx")
-
-        if not isinstance(patient_idx, int) or not (0 <= patient_idx <= len(X_test) - 1):
-            return jsonify({"error": "invalid index"}), 400
-
-        result = run_delirium_agent(patient_idx, ENSEMBLE_MODEL, X_test, y_test, FEATURE_NAMES)
-
-        if result["risk_result"]["risk_level"] == "HIGH":
-            try:
-                broker  = os.environ.get("DW_MQTT_BROKER", "172.20.10.2")
-                topic   = "deliriumwatch/pager/doc2/alerts"
-                payload = json.dumps({
-                    "patient_id": patient_idx,
-                    "risk":       result["risk_result"]["risk_percentage"],
-                    "alert":      result["alert_text"][:120],
-                    "timestamp":  datetime.now().isoformat(),
-                })
-                mqtt_publish.single(topic, payload, hostname=broker)
-                print(f"MQTT alert sent for patient {patient_idx}")
-            except Exception as mqtt_err:
-                print(f"MQTT broker offline, skipping: {mqtt_err}")
-
-        return jsonify(result), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"error": "AMR cohort agent is disabled (no AMR cohort CSV configured)."}), 503
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
-/* 
-   DeliriumWatch — Ultra Premium Clinical Interface
+/*
+   ResistAlert — AMR CDSS — Ultra Premium Clinical Interface
 */
 
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -126,6 +126,15 @@ body {
   letter-spacing: 0.05em;
 }
 .form-label-sm { font-size: 0.75rem; font-weight: 500; color: var(--dw-text-muted); margin-bottom: 4px; }
+
+.order-item-check {
+  display: flex; align-items: center;
+  font-size: 0.75rem; font-weight: 500; color: var(--dw-text);
+  padding: 6px 8px; border-radius: var(--radius-sm);
+  border: 1px solid var(--dw-border); background: var(--dw-bg);
+  cursor: pointer; transition: border-color 0.15s;
+}
+.order-item-check:hover { border-color: var(--dw-text-muted); }
 
 .form-control, .form-select {
   background-color: var(--dw-bg);

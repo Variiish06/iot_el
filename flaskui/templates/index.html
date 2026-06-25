@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>DeliriumWatch — ICU Delirium CDSS</title>
-  <meta name="description" content="Clinical Decision Support System for ICU Delirium prediction using XGBoost and NID biomarker">
+  <title>ResistAlert — ICU AMR CDSS</title>
+  <meta name="description" content="Clinical Decision Support System for ICU Antimicrobial Resistance (AMR) prediction using a LightGBM/XGBoost/CatBoost ensemble">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
@@ -17,16 +17,16 @@
 <nav class="navbar-dw">
   <div class="container-fluid d-flex align-items-center px-3">
     <div class="d-flex align-items-center gap-3">
-      <div class="nav-logo"><i class="fa-solid fa-brain"></i></div>
+      <div class="nav-logo"><i class="fa-solid fa-bacteria"></i></div>
       <div>
-        <div class="nav-title">DeliriumWatch</div>
-        <div class="nav-subtitle">Temporal Early Warning CDSS • MIMIC-IV</div>
+        <div class="nav-title">ResistAlert</div>
+        <div class="nav-subtitle">Antimicrobial Resistance CDSS • MIMIC-IV</div>
       </div>
       <span class="badge-live ms-3"><i class="fa-solid fa-circle-dot me-1"></i>LIVE</span>
     </div>
     <div class="d-flex align-items-center gap-3 ms-auto">
-      <div class="nav-stat"><i class="fa-solid fa-database me-1"></i>25,843 stays</div>
-      <div class="nav-stat"><i class="fa-solid fa-chart-line me-1"></i>AUROC 0.8511</div>
+      <div class="nav-stat"><i class="fa-solid fa-vial-virus me-1"></i>MIMIC-IV micro</div>
+      <div class="nav-stat"><i class="fa-solid fa-chart-line me-1"></i>AUROC 0.8613</div>
       <button class="btn btn-sm btn-outline-light border-0 px-2" id="themeToggle" title="Toggle theme">
         <i class="fa-solid fa-sun"></i>
       </button>
@@ -71,11 +71,12 @@
               <i class="fa-solid fa-wand-magic-sparkles me-1"></i>Presets
             </button>
             <ul class="dropdown-menu dropdown-menu-dark">
-              <li><a class="dropdown-item" href="#" onclick="loadPreset('high_septic')"><i class="fa-solid fa-skull text-danger me-2"></i>High-Risk Septic</a></li>
-              <li><a class="dropdown-item" href="#" onclick="loadPreset('cardiac_arrest')"><i class="fa-solid fa-heart-pulse text-danger me-2"></i>Cardiac Arrest</a></li>
-              <li><a class="dropdown-item" href="#" onclick="loadPreset('medium_postsurg')"><i class="fa-solid fa-triangle-exclamation text-warning me-2"></i>Post-Surgical</a></li>
-              <li><a class="dropdown-item" href="#" onclick="loadPreset('neuro_trauma')"><i class="fa-solid fa-brain text-warning me-2"></i>Neuro Trauma</a></li>
-              <li><a class="dropdown-item" href="#" onclick="loadPreset('low_stable')"><i class="fa-solid fa-check text-success me-2"></i>Stable Cardiac</a></li>
+              <li><h6 class="dropdown-header">Real MIMIC-IV cases</h6></li>
+              <li><a class="dropdown-item" href="#" onclick="loadPreset('klebsiella_r')"><i class="fa-solid fa-skull text-danger me-2"></i>Klebsiella (resistant)</a></li>
+              <li><a class="dropdown-item" href="#" onclick="loadPreset('esbl_ecoli')"><i class="fa-solid fa-bacteria text-danger me-2"></i>E. coli (resistant)</a></li>
+              <li><a class="dropdown-item" href="#" onclick="loadPreset('pseudomonas_r')"><i class="fa-solid fa-lungs text-danger me-2"></i>Pseudomonas (resistant)</a></li>
+              <li><a class="dropdown-item" href="#" onclick="loadPreset('staph_s')"><i class="fa-solid fa-check text-success me-2"></i>S. aureus (susceptible)</a></li>
+              <li><a class="dropdown-item" href="#" onclick="loadPreset('ecoli_s')"><i class="fa-solid fa-check text-success me-2"></i>E. coli (susceptible)</a></li>
             </ul>
           </div>
         </div>
@@ -107,63 +108,118 @@
               </div>
             </div>
 
-            <!-- Demographics -->
-            <div class="section-label"><i class="fa-solid fa-user-doctor me-1"></i>Demographics & Acuity</div>
+            <!-- Demographics & Encounter -->
+            <div class="section-label"><i class="fa-solid fa-user-doctor me-1"></i>Demographics & Encounter</div>
             <div class="row g-2 mb-3">
               <div class="col-4">
                 <label class="form-label-sm">Age</label>
-                <input type="number" step="1" class="form-control form-control-sm" name="age" value="{{ values['age'] }}" id="inp_age">
+                <input type="number" step="1" class="form-control form-control-sm" name="age" value="{{ values['age'] }}">
               </div>
               <div class="col-4">
-                <label class="form-label-sm">Avg SOFA</label>
-                <input type="number" step="0.1" class="form-control form-control-sm" name="avg_sofa" value="{{ values['avg_sofa'] }}" id="inp_sofa">
+                <label class="form-label-sm">ICU Patient</label>
+                <select class="form-select form-select-sm" name="icu_select">
+                  <option value="Yes" {% if values['icu_select']=='Yes' %}selected{% endif %}>Yes</option>
+                  <option value="No" {% if values['icu_select']=='No' %}selected{% endif %}>No</option>
+                </select>
               </div>
               <div class="col-4">
-                <label class="form-label-sm">ICU Unit</label>
-                <select class="form-select form-select-sm" name="icu_select" id="inp_icu">
-                  {% for icu in icu_options %}<option value="{{ icu }}" {% if icu == icu_sel %}selected{% endif %}>{{ icu[:12] }}</option>{% endfor %}
+                <label class="form-label-sm">Days Since Adm.</label>
+                <input type="number" step="1" class="form-control form-control-sm" name="days_since_admission" value="{{ values['days_since_admission'] }}">
+              </div>
+              <div class="col-6">
+                <label class="form-label-sm">Admission Type</label>
+                <select class="form-select form-select-sm" name="admission_type">
+                  {% for at in admission_type_options %}<option value="{{ at }}" {% if at == values['admission_type'] %}selected{% endif %}>{{ at }}</option>{% endfor %}
+                </select>
+              </div>
+              <div class="col-6">
+                <label class="form-label-sm">Admission From</label>
+                <select class="form-select form-select-sm" name="admission_location">
+                  {% for al in admission_location_options %}<option value="{{ al }}" {% if al == values['admission_location'] %}selected{% endif %}>{{ al }}</option>{% endfor %}
                 </select>
               </div>
             </div>
 
-            <!-- Vitals -->
-            <div class="section-label"><i class="fa-solid fa-heart-pulse me-1"></i>Hemodynamics (24h)</div>
+            <!-- Microbiology -->
+            <div class="section-label"><i class="fa-solid fa-vial-virus me-1"></i>Microbiology Specimen <span class="badge bg-primary ms-1" style="font-size:0.55rem">TOP DRIVER</span></div>
             <div class="row g-2 mb-3">
-              <div class="col-4"><label class="form-label-sm">HR Mean</label><input type="number" step="0.1" class="form-control form-control-sm" name="hr_mean" value="{{ values['hr_mean'] }}" id="inp_hr"></div>
-              <div class="col-4"><label class="form-label-sm">RR Mean</label><input type="number" step="0.1" class="form-control form-control-sm" name="rr_mean" value="{{ values['rr_mean'] }}" id="inp_rr"></div>
-              <div class="col-4"><label class="form-label-sm">MAP</label><input type="number" step="0.1" class="form-control form-control-sm" name="nibp_mean" value="{{ values['nibp_mean'] }}" id="inp_map"></div>
-              <div class="col-4"><label class="form-label-sm">SpO₂ Min</label><input type="number" step="0.1" class="form-control form-control-sm text-danger fw-bold" name="spo2_min" value="{{ values['spo2_min'] }}" id="inp_spo2"></div>
-              <div class="col-4"><label class="form-label-sm">SpO₂ Mean</label><input type="number" step="0.1" class="form-control form-control-sm" name="spo2_mean" value="{{ values['spo2_mean'] }}" id="inp_spo2m"></div>
-              <div class="col-4"><label class="form-label-sm">A-Line</label>
-                <select class="form-select form-select-sm" name="abp_measured" id="inp_abp"><option value="1" {% if values['abp_measured']==1 %}selected{% endif %}>Yes</option><option value="0" {% if values['abp_measured']==0 %}selected{% endif %}>No</option></select>
+              <div class="col-12">
+                <label class="form-label-sm">Specimen Source</label>
+                <select class="form-select form-select-sm" name="specimen_source">
+                  {% for s in specimen_options %}<option value="{{ s }}" {% if s == values['specimen_source'] %}selected{% endif %}>{{ s }}</option>{% endfor %}
+                </select>
+              </div>
+              <div class="col-6">
+                <label class="form-label-sm">Organism</label>
+                <select class="form-select form-select-sm" name="org_select">
+                  {% for o in organism_options %}<option value="{{ o }}" {% if o == values['org_select'] %}selected{% endif %}>{{ o }}</option>{% endfor %}
+                </select>
+              </div>
+              <div class="col-6">
+                <label class="form-label-sm">Antibiotic Tested</label>
+                <select class="form-select form-select-sm" name="ab_select">
+                  {% for a in antibiotic_options %}<option value="{{ a }}" {% if a == values['ab_select'] %}selected{% endif %}>{{ a }}</option>{% endfor %}
+                </select>
               </div>
             </div>
-            <!-- Hidden variability fields -->
-            <input type="hidden" name="hr_std" value="{{ values['hr_std'] }}">
-            <input type="hidden" name="rr_std" value="{{ values['rr_std'] }}">
-            <input type="hidden" name="admission_sofa" value="{{ values['admission_sofa'] }}">
-            <input type="hidden" name="unique_sedation_drugs" value="{{ values['unique_sedation_drugs'] }}">
 
-            <!-- Sedation -->
-            <div class="section-label"><i class="fa-solid fa-pills me-1"></i>Sedation (24h Cumulative)</div>
-            <div class="row g-2 mb-3">
-              <div class="col-3"><label class="form-label-sm">Propofol</label><input type="number" step="1" class="form-control form-control-sm" name="propofol_total" value="{{ values['propofol_total'] }}" id="inp_prop"></div>
-              <div class="col-3"><label class="form-label-sm">Fentanyl</label><input type="number" step="1" class="form-control form-control-sm" name="fentanyl_total" value="{{ values['fentanyl_total'] }}" id="inp_fent"></div>
-              <div class="col-3"><label class="form-label-sm">Midaz</label><input type="number" step="0.1" class="form-control form-control-sm" name="midazolam_total" value="{{ values['midazolam_total'] }}" id="inp_midaz"></div>
-              <div class="col-3"><label class="form-label-sm">Lorazep</label><input type="number" step="0.1" class="form-control form-control-sm" name="lorazepam_total" value="{{ values['lorazepam_total'] }}" id="inp_loraz"></div>
-            </div>
-
-            <!-- NID Biomarker -->
-            <div class="nid-card">
+            <!-- Prior AMR History -->
+            <div class="nid-card mb-3">
               <div class="d-flex justify-content-between align-items-center mb-2">
-                <span class="fw-700"><i class="fa-solid fa-moon me-1"></i>NID Biomarker</span>
-                <span class="badge bg-primary">SHAP Rank #1</span>
+                <span class="fw-700"><i class="fa-solid fa-clock-rotate-left me-1"></i>Prior AMR History</span>
+                <span class="badge bg-secondary" title="Resistant Count is a top-5 model feature; the Yes/No flag is redundant with it">Count = key signal</span>
               </div>
-              <div class="d-flex align-items-center gap-2">
-                <input type="range" class="form-range flex-grow-1" min="0" max="1" step="0.01" name="nid_score" value="{{ values['nid_score'] }}" oninput="document.getElementById('nidVal').innerText=this.value" id="inp_nid">
-                <span class="nid-value" id="nidVal">{{ values['nid_score'] }}</span>
+              <div class="row g-2">
+                <div class="col-4">
+                  <label class="form-label-sm">Past Resistance</label>
+                  <select class="form-select form-select-sm" name="prior_amr_history">
+                    <option value="Yes" {% if values['prior_amr_history']=='Yes' %}selected{% endif %}>Yes</option>
+                    <option value="No" {% if values['prior_amr_history']=='No' %}selected{% endif %}>No</option>
+                  </select>
+                </div>
+                <div class="col-4">
+                  <label class="form-label-sm">Resistant Count</label>
+                  <input type="number" step="1" class="form-control form-control-sm" name="prior_resistant_count" value="{{ values['prior_resistant_count'] }}">
+                </div>
+                <div class="col-4">
+                  <label class="form-label-sm">Prev. Cultures</label>
+                  <input type="number" step="1" class="form-control form-control-sm" name="num_previous_cultures" value="{{ values['num_previous_cultures'] }}">
+                </div>
               </div>
-              <div class="text-muted mt-1" style="font-size:0.65rem">NIGHTTIME EVENTS (22h-06h) / TOTAL EVENTS</div>
+            </div>
+
+            <!-- Antibiotic Exposure -->
+            <div class="section-label"><i class="fa-solid fa-pills me-1"></i>Antibiotic Exposure (90d)</div>
+            <div class="row g-2 mb-2">
+              <div class="col-6"><label class="form-label-sm">Abx Orders (90d)</label><input type="number" step="1" class="form-control form-control-sm" name="antibiotic_count_90d" value="{{ values['antibiotic_count_90d'] }}"></div>
+              <div class="col-6"><label class="form-label-sm">Days Since Last Abx</label><input type="number" step="1" class="form-control form-control-sm" name="days_since_last_antibiotic" value="{{ values['days_since_last_antibiotic'] }}"></div>
+            </div>
+            <div class="row g-1 mb-3">
+              {% for key, label in exposure_flags %}
+              <div class="col-6">
+                <label class="order-item-check"><input type="checkbox" class="form-check-input me-1" name="{{ key }}" value="1" {% if values[key]==1 %}checked{% endif %}> {{ label }}</label>
+              </div>
+              {% endfor %}
+            </div>
+
+            <!-- Comorbidities -->
+            <div class="section-label"><i class="fa-solid fa-notes-medical me-1"></i>Comorbidities</div>
+            <div class="row g-1 mb-3">
+              {% for key, label in comorbidity_flags %}
+              <div class="col-6">
+                <label class="order-item-check"><input type="checkbox" class="form-check-input me-1" name="{{ key }}" value="1" {% if values[key]==1 %}checked{% endif %}> {{ label }}</label>
+              </div>
+              {% endfor %}
+            </div>
+
+            <!-- Labs -->
+            <div class="section-label"><i class="fa-solid fa-flask-vial me-1"></i>Pre-Culture Labs</div>
+            <div class="row g-2 mb-3">
+              <div class="col-4"><label class="form-label-sm">WBC (peak)</label><input type="number" step="0.1" class="form-control form-control-sm" name="wbc_max" value="{{ values['wbc_max'] }}"></div>
+              <div class="col-4"><label class="form-label-sm">Hgb (peak)</label><input type="number" step="0.1" class="form-control form-control-sm" name="hemoglobin_max" value="{{ values['hemoglobin_max'] }}"></div>
+              <div class="col-4"><label class="form-label-sm">Creatinine</label><input type="number" step="0.1" class="form-control form-control-sm" name="creatinine_last_value" value="{{ values['creatinine_last_value'] }}"></div>
+              <div class="col-6"><label class="form-label-sm">Platelets</label><input type="number" step="1" class="form-control form-control-sm" name="platelets_last_value" value="{{ values['platelets_last_value'] }}"></div>
+              <div class="col-6"><label class="form-label-sm">Lactate (peak)</label><input type="number" step="0.1" class="form-control form-control-sm" name="lactate_max" value="{{ values['lactate_max'] }}"></div>
             </div>
 
             <input type="hidden" name="model_select" value="ensemble">
@@ -258,13 +314,14 @@
                 <div class="gauge-value {% if label == 'HIGH' %}text-danger{% elif label == 'MEDIUM' %}text-warning{% else %}text-success{% endif %}">
                   {{ '%.1f'|format(prob*100) }}%
                 </div>
-                <div class="gauge-label">Delirium Risk</div>
+                <div class="gauge-label">AMR Resistance Risk</div>
               </div>
               <div class="mt-3">
                 <span class="risk-badge-lg risk-{{ label|lower }}">
-                  {% if label == 'HIGH' %}<i class="fa-solid fa-skull me-1"></i>CRITICAL{% elif label == 'MEDIUM' %}<i class="fa-solid fa-triangle-exclamation me-1"></i>ELEVATED{% else %}<i class="fa-solid fa-shield-check me-1"></i>NORMAL{% endif %}
+                  {% if label == 'HIGH' %}<i class="fa-solid fa-skull me-1"></i>LIKELY RESISTANT{% elif label == 'MEDIUM' %}<i class="fa-solid fa-triangle-exclamation me-1"></i>INDETERMINATE{% else %}<i class="fa-solid fa-shield-check me-1"></i>LIKELY SUSCEPTIBLE{% endif %}
                 </span>
               </div>
+              <div class="mt-2 text-muted" style="font-size:0.62rem"><i class="fa-solid fa-circle-info me-1"></i>P(resistant) • ensemble AUROC 0.86</div>
               {% if dispatch_status %}
               <div class="mt-2"><span class="badge bg-info bg-opacity-25 text-info"><i class="fa-solid fa-tower-broadcast me-1"></i>Paged: {{ dispatch_status }}</span></div>
               {% endif %}
@@ -327,13 +384,13 @@
             <div class="card-body p-0">
               {% if label == 'HIGH' or label == 'MEDIUM' %}
               <div class="order-list">
-                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Initiate CAM-ICU assessment q4h</label>
-                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Cluster nursing care to night blocks</label>
-                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Daily SAT/SBT protocol check</label>
-                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Dim lights + eye mask protocol</label>
-                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Review sedation — minimize benzos</label>
+                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Initiate contact precautions / isolation</label>
+                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Notify antimicrobial stewardship team</label>
+                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Send confirmatory culture &amp; sensitivity</label>
+                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Broaden empiric therapy pending C&amp;S</label>
+                <label class="order-item"><input type="checkbox" class="form-check-input me-2"> Avoid recently-exposed antibiotic classes</label>
                 {% if label == 'HIGH' %}
-                <label class="order-item order-critical"><input type="checkbox" class="form-check-input me-2"> <strong>STAT: Page attending physician</strong></label>
+                <label class="order-item order-critical"><input type="checkbox" class="form-check-input me-2"> <strong>STAT: Infectious Disease consult</strong></label>
                 {% endif %}
               </div>
               {% else %}

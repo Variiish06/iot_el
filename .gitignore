@@ -1,7 +1,9 @@
-# Patient data — never commit
+# Patient data — never commit (PhysioNet DUA: MIMIC-IV-derived)
 *.csv
 *.xlsx
+*.parquet
 data/
+amr_presets.json
 
 # Trained model files — large binary files
 *.pkl

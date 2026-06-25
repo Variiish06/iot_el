@@ -1,5 +1,5 @@
 /* ═══════════════════════════════════════════════════════════════
-   DeliriumWatch — Frontend Logic
+   ResistAlert (AMR CDSS) — Frontend Logic
    ═══════════════════════════════════════════════════════════════ */
 
 // ─── THEME ──────────────────────────────────────────────────────
@@ -26,56 +26,34 @@ function setLight() {
   themeBtn.innerHTML = '<i class="fa-solid fa-moon"></i>';
 }
 
+// ─── FIELD SETTER (resolves by name=, handles select/checkbox/number) ──
+function setField(name, val) {
+  const el = document.querySelector(`[name="${name}"]`);
+  if (!el || val === undefined || val === null) return;
+  if (el.type === 'checkbox') {
+    el.checked = (val === 1 || val === '1' || val === true || val === 'Yes' || val === 'on');
+  } else {
+    el.value = val;
+  }
+}
+
 // ─── PRESETS ────────────────────────────────────────────────────
 function loadPreset(presetId) {
   fetch(`/api/presets/${presetId}`)
     .then(r => r.json())
     .then(data => {
-      const map = {
-        'patient_name': 'inp_name', 'patient_bed': 'inp_bed',
-        'patient_zone': 'inp_zone', 'gender_select': 'inp_gender',
-        'age': 'inp_age', 'avg_sofa': 'inp_sofa', 'icu_select': 'inp_icu',
-        'hr_mean': 'inp_hr', 'rr_mean': 'inp_rr', 'nibp_mean': 'inp_map',
-        'spo2_min': 'inp_spo2', 'spo2_mean': 'inp_spo2m', 'abp_measured': 'inp_abp',
-        'propofol_total': 'inp_prop', 'fentanyl_total': 'inp_fent',
-        'midazolam_total': 'inp_midaz', 'lorazepam_total': 'inp_loraz',
-        'nid_score': 'inp_nid',
-      };
-      for (const [key, elId] of Object.entries(map)) {
-        const el = document.getElementById(elId);
-        if (el && data[key] !== undefined) el.value = data[key];
-      }
-      // Hidden fields
-      const hiddens = ['hr_std','rr_std','admission_sofa','unique_sedation_drugs'];
-      hiddens.forEach(h => {
-        const el = document.querySelector(`[name="${h}"]`);
-        if (el && data[h] !== undefined) el.value = data[h];
-      });
-      // NID display
-      const nidEl = document.getElementById('nidVal');
-      if (nidEl && data.nid_score !== undefined) nidEl.textContent = data.nid_score;
+      for (const key in data) setField(key, data[key]);
     });
 }
 
 // ─── LOAD PATIENT FROM ROSTER ───────────────────────────────────
 function loadPatient(p) {
-  const el = (id) => document.getElementById(id);
-  if (el('inp_name')) el('inp_name').value = p.name || '';
-  if (el('inp_bed')) el('inp_bed').value = p.bed || '';
-  if (el('inp_zone')) el('inp_zone').value = p.zone || 'Bay A';
-  if (el('inp_gender')) el('inp_gender').value = p.gender || 'Male';
+  setField('patient_name', p.name);
+  setField('patient_bed', p.bed);
+  setField('patient_zone', p.zone || 'Bay A');
+  setField('gender_select', p.gender || 'Male');
   if (p.values) {
-    const valMap = {
-      'age':'inp_age','avg_sofa':'inp_sofa','hr_mean':'inp_hr','rr_mean':'inp_rr',
-      'nibp_mean':'inp_map','spo2_min':'inp_spo2','spo2_mean':'inp_spo2m',
-      'abp_measured':'inp_abp','propofol_total':'inp_prop','fentanyl_total':'inp_fent',
-      'midazolam_total':'inp_midaz','lorazepam_total':'inp_loraz','nid_score':'inp_nid'
-    };
-    for (const [k, id] of Object.entries(valMap)) {
-      if (el(id) && p.values[k] !== undefined) el(id).value = p.values[k];
-    }
-    const nv = document.getElementById('nidVal');
-    if (nv && p.values.nid_score !== undefined) nv.textContent = p.values.nid_score;
+    for (const k in p.values) setField(k, p.values[k]);
   }
   // Scroll to top on mobile
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -135,7 +113,9 @@ function renderCharts() {
     try {
       const sData = JSON.parse(shapElem.textContent);
       if (sData.length > 0) {
-        const labels = sData.map(d => d.name.toUpperCase().replace('_TOTAL', '').replace('ICU_', ''));
+        const labels = sData.map(d => d.name
+          .replace(/_last_value$/, '').replace(/_max$/, ' (max)').replace(/_min$/, ' (min)')
+          .replace(/_/g, ' ').toUpperCase());
         const values = sData.map(d => d.value);
         const bgCols = values.map(v => v >= 0
           ? (dark ? 'rgba(239,68,68,0.7)' : 'rgba(239,68,68,0.8)')
