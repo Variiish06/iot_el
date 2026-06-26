@@ -19,7 +19,7 @@ from sklearn.metrics import roc_auc_score
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(BASE_DIR, "..")
 DATA = os.path.join(ROOT, "dev_engineered_dataset_v3.parquet")
-MODEL = os.path.join(ROOT, "final_best_model.pkl")
+MODEL = os.environ.get("DW_AMR_PATH", os.path.join(ROOT, "final_best_model _v2.pkl"))
 
 CAT = ["org_name", "ab_name", "spec_type_desc", "test_name", "admission_location"]
 
@@ -125,10 +125,8 @@ def to_form(row, name, bed, zone):
         "specimen_source": str(row.get("spec_type_desc", "")),
         "org_select": str(row.get("org_name", "")),
         "ab_select": str(row.get("ab_name", "")),
-        "prior_amr_history": "Yes" if row.get("prior_amr_history", 0) == 1 else "No",
         "prior_resistant_count": int(row.get("prior_resistant_count", 0) or 0),
-        "num_previous_cultures": int(row.get("num_previous_cultures", 0) or 0),
-        "antibiotic_count_90d": int(row.get("antibiotic_count_90d", 0) or 0),
+        "antibiotic_count_30d": int(row.get("antibiotic_count_30d", 0) or 0),
         "days_since_last_antibiotic": int(row["days_since_last_antibiotic"]) if pd.notna(row.get("days_since_last_antibiotic")) else 30,
     }
     for k in EXP + COMORB:

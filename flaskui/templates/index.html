@@ -26,7 +26,7 @@
     </div>
     <div class="d-flex align-items-center gap-3 ms-auto">
       <div class="nav-stat"><i class="fa-solid fa-vial-virus me-1"></i>MIMIC-IV micro</div>
-      <div class="nav-stat"><i class="fa-solid fa-chart-line me-1"></i>AUROC 0.8613</div>
+      <div class="nav-stat"><i class="fa-solid fa-chart-line me-1"></i>AUROC 0.8632</div>
       <button class="btn btn-sm btn-outline-light border-0 px-2" id="themeToggle" title="Toggle theme">
         <i class="fa-solid fa-sun"></i>
       </button>
@@ -167,31 +167,21 @@
             <div class="nid-card mb-3">
               <div class="d-flex justify-content-between align-items-center mb-2">
                 <span class="fw-700"><i class="fa-solid fa-clock-rotate-left me-1"></i>Prior AMR History</span>
-                <span class="badge bg-secondary" title="Resistant Count is a top-5 model feature; the Yes/No flag is redundant with it">Count = key signal</span>
+                <span class="badge bg-primary" title="Top-3 model feature">KEY SIGNAL</span>
               </div>
               <div class="row g-2">
-                <div class="col-4">
-                  <label class="form-label-sm">Past Resistance</label>
-                  <select class="form-select form-select-sm" name="prior_amr_history">
-                    <option value="Yes" {% if values['prior_amr_history']=='Yes' %}selected{% endif %}>Yes</option>
-                    <option value="No" {% if values['prior_amr_history']=='No' %}selected{% endif %}>No</option>
-                  </select>
-                </div>
-                <div class="col-4">
-                  <label class="form-label-sm">Resistant Count</label>
-                  <input type="number" step="1" class="form-control form-control-sm" name="prior_resistant_count" value="{{ values['prior_resistant_count'] }}">
-                </div>
-                <div class="col-4">
-                  <label class="form-label-sm">Prev. Cultures</label>
-                  <input type="number" step="1" class="form-control form-control-sm" name="num_previous_cultures" value="{{ values['num_previous_cultures'] }}">
+                <div class="col-12">
+                  <label class="form-label-sm">Prior Resistant Cultures (count)</label>
+                  <input type="number" step="1" min="0" class="form-control form-control-sm" name="prior_resistant_count" value="{{ values['prior_resistant_count'] }}">
+                  <div class="text-muted mt-1" style="font-size:0.62rem">Number of organisms previously isolated resistant for this patient</div>
                 </div>
               </div>
             </div>
 
             <!-- Antibiotic Exposure -->
-            <div class="section-label"><i class="fa-solid fa-pills me-1"></i>Antibiotic Exposure (90d)</div>
+            <div class="section-label"><i class="fa-solid fa-pills me-1"></i>Antibiotic Exposure (30d)</div>
             <div class="row g-2 mb-2">
-              <div class="col-6"><label class="form-label-sm">Abx Orders (90d)</label><input type="number" step="1" class="form-control form-control-sm" name="antibiotic_count_90d" value="{{ values['antibiotic_count_90d'] }}"></div>
+              <div class="col-6"><label class="form-label-sm">Abx Orders (30d)</label><input type="number" step="1" min="0" class="form-control form-control-sm" name="antibiotic_count_30d" value="{{ values['antibiotic_count_30d'] }}"></div>
               <div class="col-6"><label class="form-label-sm">Days Since Last Abx</label><input type="number" step="1" class="form-control form-control-sm" name="days_since_last_antibiotic" value="{{ values['days_since_last_antibiotic'] }}"></div>
             </div>
             <div class="row g-1 mb-3">
@@ -321,7 +311,7 @@
                   {% if label == 'HIGH' %}<i class="fa-solid fa-skull me-1"></i>LIKELY RESISTANT{% elif label == 'MEDIUM' %}<i class="fa-solid fa-triangle-exclamation me-1"></i>INDETERMINATE{% else %}<i class="fa-solid fa-shield-check me-1"></i>LIKELY SUSCEPTIBLE{% endif %}
                 </span>
               </div>
-              <div class="mt-2 text-muted" style="font-size:0.62rem"><i class="fa-solid fa-circle-info me-1"></i>P(resistant) • ensemble AUROC 0.86</div>
+              <div class="mt-2 text-muted" style="font-size:0.62rem"><i class="fa-solid fa-circle-info me-1"></i>Calibrated P(resistant) • XGBoost AUROC 0.86</div>
               {% if dispatch_status %}
               <div class="mt-2"><span class="badge bg-info bg-opacity-25 text-info"><i class="fa-solid fa-tower-broadcast me-1"></i>Paged: {{ dispatch_status }}</span></div>
               {% endif %}
@@ -335,19 +325,19 @@
         <!-- Model Comparison + Trend -->
         <div class="col-md-7">
           <div class="card text-bg-dark h-100">
-            <div class="card-header"><span><i class="fa-solid fa-chart-line me-2"></i>Model Comparison & Trend</span></div>
+            <div class="card-header"><span><i class="fa-solid fa-chart-line me-2"></i>Model Confidence & Trend</span></div>
             <div class="card-body">
               {% if prob is not none %}
               <!-- Model cards -->
               <div class="row g-2 mb-3">
                 {% for mname, mprob in all_probs.items() %}
-                <div class="col-4">
+                <div class="col">
                   <div class="model-card {% if mname == selected_model %}model-active{% endif %}">
-                    <div class="model-name">{{ mname|upper }}</div>
-                    <div class="model-score {% if risk_label is defined %}{% endif %}">
+                    <div class="model-name">{% if mname == 'model' %}Calibrated XGBoost{% else %}{{ mname|upper }}{% endif %}</div>
+                    <div class="model-score">
                       {% if mprob == mprob %}{{ '%.1f'|format(mprob*100) }}%{% else %}N/A{% endif %}
                     </div>
-                    <div class="model-auroc">AUROC {{ aurocs.get(mname, 'N/A') }}</div>
+                    <div class="model-auroc">AUROC {{ aurocs.get(mname, 'N/A') }} • isotonic-calibrated</div>
                   </div>
                 </div>
                 {% endfor %}

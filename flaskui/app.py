@@ -40,21 +40,25 @@ app = Flask(__name__)
 # CONFIG
 # ──────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# AMR model: a single soft-voting ensemble (LightGBM + XGBoost + CatBoost).
-# It bakes in feature_names_in_, so no separate feature_names.pkl is required.
-AMR_MODEL_PATH = os.environ.get("DW_AMR_PATH", os.path.join(BASE_DIR, "..", "final_best_model.pkl"))
+# AMR model (v2): a CalibratedClassifierCV wrapping a single XGBoost — outputs
+# properly calibrated P(resistant). It bakes in feature_names_in_ (103 features),
+# so no separate feature_names.pkl is required.
+AMR_MODEL_PATH = os.environ.get("DW_AMR_PATH", os.path.join(BASE_DIR, "..", "final_best_model _v2.pkl"))
 
 MQTT_BROKER = os.environ.get("DW_MQTT_BROKER", "127.0.0.1")
 MQTT_PORT = int(os.environ.get("DW_MQTT_PORT", "1883"))
 
 ZONE_OPTIONS = ["Bay A", "Bay B", "Bay C", "Bay D"]
 
-# Per-(sub)model AUROC from the AMR manuscript leaderboard (README §6.1)
+# Risk bands on the v2 calibrated probability (Youden-optimal HIGH cut)
+RISK_HIGH = float(os.environ.get("DW_RISK_HIGH", "0.58"))
+RISK_MEDIUM = float(os.environ.get("DW_RISK_MEDIUM", "0.30"))
+
+# Display AUROC for the deployed calibrated XGBoost (v2). The key matches the
+# prediction dict in predict_amr(); legacy sub-model keys kept for back-compat.
 METRICS = {
-    "ensemble": 0.8613,   # Soft Voting Ensemble
-    "lgb": 0.8584,        # LightGBM
-    "xgb": 0.8632,        # XGBoost
-    "cat": 0.8522,        # CatBoost
+    "model": 0.8632,      # Calibrated XGBoost (v2)
+    "ensemble": 0.8613, "lgb": 0.8584, "xgb": 0.8632, "cat": 0.8522,
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -81,13 +85,14 @@ COMORBIDITY_FLAGS = [
     ("has_malignancy", "Malignancy"),
 ]
 
-# Numeric form fields and their default values
+# Numeric form fields and their default values.
+# (v2 dropped num_previous_cultures & antibiotic_count_90d; we keep the live
+# inputs — prior_resistant_count, antibiotic_count_30d — that the model uses.)
 FORM_NUMERIC_DEFAULTS = {
     "age": 65,
     "days_since_admission": 3,
     "prior_resistant_count": 0,
-    "num_previous_cultures": 1,
-    "antibiotic_count_90d": 2,
+    "antibiotic_count_30d": 1,
     "days_since_last_antibiotic": 15,
     "wbc_max": 11.0,
     "hemoglobin_max": 11.5,
@@ -142,7 +147,6 @@ FORM_SELECT_DEFAULTS = {
     "specimen_source": _first(SPECIMEN_OPTIONS),
     "org_select": _first(ORGANISM_OPTIONS, "ESCHERICHIA COLI"),
     "ab_select": _first(ANTIBIOTIC_OPTIONS, "AMPICILLIN"),
-    "prior_amr_history": "No",
 }
 
 # Real example patients (built from the dataset; stripped of internal _pred/_label)
@@ -415,14 +419,14 @@ def build_row_from_form(form) -> Tuple[pd.DataFrame, Dict]:
     if ab in AB_TO_ITEMID:
         setf("ab_itemid", AB_TO_ITEMID[ab])
 
-    # Prior AMR history (top predictor)
-    setf("prior_amr_history", 1.0 if values.get("prior_amr_history", "No") == "Yes" else 0.0)
-    setf("prior_resistant_count", num("prior_resistant_count"))
-    setf("num_previous_cultures", num("num_previous_cultures"))
+    # Prior resistance history. prior_amr_history is exactly (prior_resistant_count > 0),
+    # so we derive it from the count rather than asking for it twice.
+    prc = num("prior_resistant_count")
+    setf("prior_resistant_count", prc)
+    setf("prior_amr_history", 1.0 if prc > 0 else 0.0)
 
     # Antibiotic exposure
-    setf("antibiotic_count_90d", num("antibiotic_count_90d"))
-    setf("antibiotic_count_30d", min(num("antibiotic_count_90d"), 4))
+    setf("antibiotic_count_30d", num("antibiotic_count_30d"))
     setf("days_since_last_antibiotic", num("days_since_last_antibiotic"))
     for key, _ in EXPOSURE_FLAGS:
         setf(key, 1.0 if values.get(key) else 0.0)
@@ -451,15 +455,17 @@ def build_row_from_form(form) -> Tuple[pd.DataFrame, Dict]:
 
 
 def predict_amr(X: pd.DataFrame) -> Dict[str, float]:
-    """Return resistance probability for the ensemble + each sub-model (faithful)."""
+    """Return calibrated P(resistant). Works for the v2 CalibratedClassifierCV
+    (single 'model' key) and the legacy VotingClassifier (per-sub-model keys)."""
     out: Dict[str, float] = {}
     if AMR_MODEL is None or not hasattr(AMR_MODEL, "predict_proba"):
         return out
     try:
-        out["ensemble"] = float(AMR_MODEL.predict_proba(X)[:, 1][0])
+        out["model"] = float(AMR_MODEL.predict_proba(X)[:, 1][0])
     except Exception as e:
-        print(f"Ensemble predict failed: {e}")
-        out["ensemble"] = float("nan")
+        print(f"Model predict failed: {e}")
+        out["model"] = float("nan")
+    # Legacy ensemble sub-models (empty for the calibrated v2 model)
     for name, est in getattr(AMR_MODEL, "named_estimators_", {}).items():
         try:
             out[name] = float(est.predict_proba(X)[:, 1][0])
@@ -469,23 +475,42 @@ def predict_amr(X: pd.DataFrame) -> Dict[str, float]:
 
 
 def risk_label(prob: float) -> str:
-    # Bands on the model's true (faithful) probability. LOW/MEDIUM boundary at the
-    # README §8 Youden-optimal threshold (0.1684); HIGH at the default 0.50 cut.
+    # Bands on the v2 calibrated P(resistant). HIGH at the Youden-optimal cut
+    # (~0.58, the point that best separates resistant from susceptible);
+    # LOW/MEDIUM split at 0.30. Tunable via env if needed for the exhibition.
     if not np.isfinite(prob):
         return "UNKNOWN"
-    if prob >= 0.50:
+    if prob >= RISK_HIGH:
         return "HIGH"
-    elif prob >= 0.1684:
+    elif prob >= RISK_MEDIUM:
         return "MEDIUM"
     return "LOW"
+
+
+def _tree_model_for_shap(model):
+    """Return the underlying tree estimator SHAP's TreeExplainer can handle,
+    across v2 (CalibratedClassifierCV), legacy (VotingClassifier), or a raw model."""
+    if model is None:
+        return None
+    # v2: CalibratedClassifierCV(cv='prefit') -> calibrated_classifiers_[0].estimator
+    ccs = getattr(model, "calibrated_classifiers_", None)
+    if ccs:
+        base = getattr(ccs[0], "estimator", None) or getattr(ccs[0], "base_estimator", None)
+        if base is not None:
+            return base
+    # legacy: VotingClassifier with an 'xgb' member
+    named = getattr(model, "named_estimators_", {})
+    if "xgb" in named:
+        return named["xgb"]
+    return model
 
 
 def compute_shap_dict(X: pd.DataFrame) -> Dict[str, float]:
     if shap is None or AMR_MODEL is None:
         return {}
     try:
-        xgb = AMR_MODEL.named_estimators_["xgb"]
-        explainer = shap.TreeExplainer(xgb)
+        tree = _tree_model_for_shap(AMR_MODEL)
+        explainer = shap.TreeExplainer(tree)
         vals = explainer.shap_values(X)
         if isinstance(vals, list):
             vals = vals[1][0]
@@ -548,7 +573,7 @@ def dispatch_to_pagers(patient_name: str, bed: str, zone: str, risk_pct: str, ri
 # ──────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET", "POST"])
 def index():
-    selected_model = "ensemble"
+    selected_model = "model"
     prob = None
     label = None
     shap_items: List[Tuple[str, float]] = []
@@ -569,7 +594,7 @@ def index():
 
         X_row, values = build_row_from_form(request.form)
         all_probs = predict_amr(X_row)
-        prob = all_probs.get("ensemble", float("nan"))
+        prob = all_probs.get("model", float("nan"))
         label = risk_label(prob)
 
         # Add to ward roster
@@ -619,7 +644,7 @@ def index():
         shap_max=shap_max,
         shap_available=bool(shap_items),
         shap_json=json.dumps([{"name": k, "value": v} for k, v in shap_items]) if shap_items else "[]",
-        models_loaded={"ensemble": AMR_MODEL is not None},
+        models_loaded={"model": AMR_MODEL is not None},
         patient_name=patient_name,
         patient_bed=patient_bed,
         patient_zone=patient_zone,
