@@ -40,9 +40,19 @@ app = Flask(__name__)
 # CONFIG
 # ──────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# AMR model (v2): a CalibratedClassifierCV wrapping a single XGBoost — outputs
-# properly calibrated P(resistant). It bakes in feature_names_in_ (103 features),
-# so no separate feature_names.pkl is required.
+# The project root (one level up) holds the model artifacts and amr_pipeline.py,
+# which defines the classes needed to unpickle the v3 inference pipeline.
+import sys
+ROOT_DIR = os.path.dirname(BASE_DIR)
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+# AMR model (v3): AMRClinicalInferencePipeline — a self-contained pipeline that
+# takes RAW clinical fields, applies leakage-safe encoding internally, selects
+# 22 features, and outputs calibrated P(resistant) from a CalibratedClassifierCV.
+AMR_PIPELINE_PATH = os.environ.get("DW_AMR_PIPELINE_PATH", os.path.join(BASE_DIR, "..", "inference_pipeline.pkl"))
+# Legacy v2 model — kept only as a SHAP/inspection fallback (bakes in
+# feature_names_in_; superseded by the v3 pipeline for prediction).
 AMR_MODEL_PATH = os.environ.get("DW_AMR_PATH", os.path.join(BASE_DIR, "..", "final_best_model _v2.pkl"))
 
 MQTT_BROKER = os.environ.get("DW_MQTT_BROKER", "127.0.0.1")
@@ -50,15 +60,17 @@ MQTT_PORT = int(os.environ.get("DW_MQTT_PORT", "1883"))
 
 ZONE_OPTIONS = ["Bay A", "Bay B", "Bay C", "Bay D"]
 
-# Risk bands on the v2 calibrated probability (Youden-optimal HIGH cut)
-RISK_HIGH = float(os.environ.get("DW_RISK_HIGH", "0.58"))
-RISK_MEDIUM = float(os.environ.get("DW_RISK_MEDIUM", "0.30"))
+# Risk bands on the v3 calibrated probability. The model's operating (Youden)
+# threshold is 0.17; HIGH uses the higher-precision max-F1 point (~0.27).
+RISK_HIGH = float(os.environ.get("DW_RISK_HIGH", "0.27"))
+RISK_MEDIUM = float(os.environ.get("DW_RISK_MEDIUM", "0.17"))
 
-# Display AUROC for the deployed calibrated XGBoost (v2). The key matches the
-# prediction dict in predict_amr(); legacy sub-model keys kept for back-compat.
+# Display AUROC for the deployed calibrated XGBoost (v3, isotonic). The "model"
+# key matches the prediction dict in predict_amr_raw(); legacy keys kept so the
+# template's back-compat lookups stay valid.
 METRICS = {
-    "model": 0.8632,      # Calibrated XGBoost (v2)
-    "ensemble": 0.8613, "lgb": 0.8584, "xgb": 0.8632, "cat": 0.8522,
+    "model": 0.8514,      # Calibrated XGBoost (v3, isotonic) — final_model_performance.csv
+    "ensemble": 0.8514, "lgb": 0.8514, "xgb": 0.8514, "cat": 0.8514,
 }
 
 # ──────────────────────────────────────────────────────────────────
@@ -115,9 +127,25 @@ def safe_load(path: str):
         return None
 
 
+# v3 inference pipeline (primary). amr_pipeline defines the classes so the
+# artifact unpickles, and load_amr_pipeline() registers them under __main__.
+try:
+    import amr_pipeline
+    AMR_PIPE = amr_pipeline.load_amr_pipeline(AMR_PIPELINE_PATH) if os.path.exists(AMR_PIPELINE_PATH) else None
+except Exception as e:
+    print(f"Failed to load AMR pipeline: {e}")
+    AMR_PIPE = None
+
+# Training medians from the pipeline's fitted preprocessor — used to baseline the
+# few selected features the form doesn't collect (test_seq, icu_los_prior, ...).
+PIPE_MEDIANS = getattr(getattr(AMR_PIPE, "preprocessor", None), "medians", {}) or {}
+SELECTED_FEATURES: List[str] = list(getattr(AMR_PIPE, "selected_features", []))
+print(f"AMR pipeline loaded: {AMR_PIPE is not None} ({len(SELECTED_FEATURES)} selected features)")
+
+# Legacy v2 model — only referenced by the SHAP fallback / inspection paths.
 AMR_MODEL = safe_load(AMR_MODEL_PATH)
 FEATURE_NAMES: List[str] = list(getattr(AMR_MODEL, "feature_names_in_", [])) if AMR_MODEL is not None else []
-print(f"AMR model loaded: {AMR_MODEL is not None} ({len(FEATURE_NAMES)} features)")
+print(f"Legacy v2 model loaded: {AMR_MODEL is not None} ({len(FEATURE_NAMES)} features)")
 
 PREPROCESS = safe_load(PREPROCESS_PATH) or {}
 ENCODERS = PREPROCESS.get("encoders", {})              # {col: LabelEncoder}
@@ -474,6 +502,79 @@ def predict_amr(X: pd.DataFrame) -> Dict[str, float]:
     return out
 
 
+def build_raw_row_from_form(form) -> Tuple[Dict, Dict]:
+    """Map the AMR form into a RAW feature dict for the v3 pipeline.
+
+    Unlike build_row_from_form (which hand-encodes a 135-col matrix for the
+    legacy model), the v3 pipeline does its own leakage-safe encoding, so we pass
+    raw values: category strings for org/ab/specimen/admission and 'M'/'F' for
+    sex. Selected features the form doesn't collect are baselined to the
+    pipeline's training medians. Missing columns are zero-filled inside the
+    pipeline, so only fields feeding the 22 selected features matter.
+    """
+    values = collect_form_values(form)
+
+    def num(key: str) -> float:
+        try:
+            return float(values.get(key, FORM_NUMERIC_DEFAULTS.get(key, 0)))
+        except Exception:
+            return float(FORM_NUMERIC_DEFAULTS.get(key, 0))
+
+    age = num("age")
+    comorbid_count = sum(1 for key, _ in COMORBIDITY_FLAGS if values.get(key))
+    prc = num("prior_resistant_count")
+
+    def med(col: str, default: float) -> float:
+        m = PIPE_MEDIANS.get(col)
+        try:
+            return float(m) if m is not None and np.isfinite(m) else default
+        except Exception:
+            return default
+
+    raw: Dict = {
+        # Categoricals — raw strings; the pipeline target/freq-encodes these.
+        "sex": "M" if values.get("gender_select", "Male") == "Male" else "F",
+        "org_name": str(values.get("org_select", "")),
+        "ab_name": str(values.get("ab_select", "")),
+        "spec_type_desc": str(values.get("specimen_source", "")),
+        "admission_location": str(values.get("admission_location", "")),
+        "admission_type": str(values.get("admission_type", "")),
+        # Numerics feeding the 22 selected features.
+        "age": age,
+        "prior_resistant_count": prc,
+        "prior_amr_history": 1.0 if prc > 0 else 0.0,
+        "icu_admission": 1.0 if values.get("icu_select", "Yes") == "Yes" else 0.0,
+        "days_since_admission": num("days_since_admission"),
+        "days_since_last_antibiotic": num("days_since_last_antibiotic"),
+        "antibiotic_count_30d": num("antibiotic_count_30d"),
+        "comorbidity_count": comorbid_count,
+        "age_x_comorbidities": age * comorbid_count,
+        "wbc_last_value": num("wbc_max"),
+        "hemoglobin_last_value": num("hemoglobin_max"),
+        "exp_cephalosporin": 1.0 if values.get("exp_cephalosporin") else 0.0,
+        "exp_fluoroquinolone": 1.0 if values.get("exp_fluoroquinolone") else 0.0,
+        "exp_macrolide": 1.0 if values.get("exp_macrolide") else 0.0,
+        # Selected features not on the form → training medians.
+        "test_seq": med("test_seq", 1.0),
+        "icu_los_prior": med("icu_los_prior", 0.0),
+        "hemoglobin_trend": med("hemoglobin_trend", 0.0),
+    }
+    return raw, values
+
+
+def predict_amr_raw(raw_row: Dict) -> Dict[str, float]:
+    """Return calibrated P(resistant) from the v3 pipeline for one raw row."""
+    out: Dict[str, float] = {}
+    if AMR_PIPE is None:
+        return out
+    try:
+        out["model"] = float(AMR_PIPE.predict_proba([raw_row])[0])
+    except Exception as e:
+        print(f"Pipeline predict failed: {e}")
+        out["model"] = float("nan")
+    return out
+
+
 def risk_label(prob: float) -> str:
     # Bands on the v2 calibrated P(resistant). HIGH at the Youden-optimal cut
     # (~0.58, the point that best separates resistant from susceptible);
@@ -510,6 +611,28 @@ def compute_shap_dict(X: pd.DataFrame) -> Dict[str, float]:
         return {}
     try:
         tree = _tree_model_for_shap(AMR_MODEL)
+        explainer = shap.TreeExplainer(tree)
+        vals = explainer.shap_values(X)
+        if isinstance(vals, list):
+            vals = vals[1][0]
+        else:
+            vals = vals[0]
+            if getattr(vals, "ndim", 1) > 1 and vals.shape[1] == 2:
+                vals = vals[:, 1]
+        return {feat: float(v) for feat, v in zip(X.columns, vals)}
+    except Exception as e:
+        print(f"SHAP failed: {e}")
+        return {}
+
+
+def compute_shap_dict_raw(raw_row: Dict) -> Dict[str, float]:
+    """SHAP over the v3 pipeline: transform the raw row to the aligned 22-feature
+    matrix, then explain the underlying tree. Degrades to {} if shap is absent."""
+    if shap is None or AMR_PIPE is None:
+        return {}
+    try:
+        X = AMR_PIPE._prepare_data([raw_row])  # 22-col, in selected order
+        tree = _tree_model_for_shap(AMR_PIPE.model)
         explainer = shap.TreeExplainer(tree)
         vals = explainer.shap_values(X)
         if isinstance(vals, list):
@@ -592,8 +715,8 @@ def index():
         patient_zone = request.form.get("patient_zone", "Bay A")
         gender_select = request.form.get("gender_select", "Male")
 
-        X_row, values = build_row_from_form(request.form)
-        all_probs = predict_amr(X_row)
+        raw_row, values = build_raw_row_from_form(request.form)
+        all_probs = predict_amr_raw(raw_row)
         prob = all_probs.get("model", float("nan"))
         label = risk_label(prob)
 
@@ -620,7 +743,7 @@ def index():
                 f"{prob*100:.1f}%", prob, label
             )
 
-        shap_dict = compute_shap_dict(X_row)
+        shap_dict = compute_shap_dict_raw(raw_row)
         shap_items = sorted(shap_dict.items(), key=lambda kv: abs(kv[1]), reverse=True)[:8]
         shap_max = max((abs(v) for k, v in shap_items), default=0.01)
 
@@ -644,7 +767,7 @@ def index():
         shap_max=shap_max,
         shap_available=bool(shap_items),
         shap_json=json.dumps([{"name": k, "value": v} for k, v in shap_items]) if shap_items else "[]",
-        models_loaded={"model": AMR_MODEL is not None},
+        models_loaded={"model": AMR_PIPE is not None},
         patient_name=patient_name,
         patient_bed=patient_bed,
         patient_zone=patient_zone,
